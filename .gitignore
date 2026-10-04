@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime crawl data
+jobs/
+*.db
+*.db-shm
+*.db-wal
+*.csv
+crawl_meta.json
+
+# Secrets
+.streamlit/secrets.toml
+.env
+
+# Temporary exports
+*.xlsx
