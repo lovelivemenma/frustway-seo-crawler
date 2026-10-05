@@ -274,45 +274,27 @@ st.set_page_config(
 )
 
 
-raw_job_id = st.query_params.get(
-    "job",
-    "",
-)
-
-JOB_ID = (
-    release_runtime.normalize_job_id(
-        raw_job_id
+raw_job_id = release_runtime.normalize_job_id(
+    st.query_params.get(
+        "job",
+        "",
     )
-    or release_runtime.new_job_id()
 )
 
-if raw_job_id != JOB_ID:
-    st.query_params["job"] = JOB_ID
-
-release_runtime.cleanup_old_jobs(
-    JOBS_ROOT,
-    ttl_hours=JOB_TTL_HOURS,
-    exclude_job_ids={JOB_ID},
+session_job_id = release_runtime.normalize_job_id(
+    st.session_state.get(
+        "active_job_id"
+    )
 )
 
-JOB_DIR = release_runtime.ensure_job_dir(
-    JOBS_ROOT,
-    JOB_ID,
-)
+if raw_job_id:
+    JOB_ID = raw_job_id
+elif session_job_id:
+    JOB_ID = session_job_id
+else:
+    JOB_ID = release_runtime.new_job_id()
 
-DB_PATH = str(
-    JOB_DIR / "seo.db"
-)
-CSV_PATH = str(
-    JOB_DIR / "crawl.csv"
-)
-META_PATH = str(
-    JOB_DIR / "crawl_meta.json"
-)
-
-previous_job = st.session_state.get(
-    "active_job_id"
-)
+previous_job = session_job_id
 
 if previous_job != JOB_ID:
     old_stop_event = st.session_state.get(
@@ -338,14 +320,38 @@ if previous_job != JOB_ID:
             None,
         )
 
-    st.session_state[
-        "active_job_id"
-    ] = JOB_ID
+st.session_state[
+    "active_job_id"
+] = JOB_ID
+
+if raw_job_id != JOB_ID:
+    st.query_params["job"] = JOB_ID
+
+release_runtime.cleanup_old_jobs(
+    JOBS_ROOT,
+    ttl_hours=JOB_TTL_HOURS,
+    exclude_job_ids={JOB_ID},
+)
+
+JOB_DIR = release_runtime.ensure_job_dir(
+    JOBS_ROOT,
+    JOB_ID,
+)
+
+DB_PATH = str(
+    JOB_DIR / "seo.db"
+)
+CSV_PATH = str(
+    JOB_DIR / "crawl.csv"
+)
+META_PATH = str(
+    JOB_DIR / "crawl_meta.json"
+)
 
 init_crawl_state()
 
 st.title(APP_TITLE)
-st.caption("HTML SEO監査用クローラー v1.9 Browser Release")
+st.caption("HTML SEO監査用クローラー v1.9.1 Browser Release")
 
 initial_crawl_state = get_crawl_snapshot()
 crawl_running = bool(
