@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.9.5
+- added a Crawl History tab in the sidebar
+- lists retained crawl jobs with last-used time, page count, status, start URL, Include Regex and Max Depth
+- allows switching back to a retained Job without manually copying the ?job= URL
+- Job switching is disabled while a crawl is running
+
+
 ## v1.9.4
 - added Page Types analysis tab with editable regex rules
 - automatically summarizes URL count, average crawl depth, average unique inlinks/outlinks, 200 OK count and indexable URLs by page type
