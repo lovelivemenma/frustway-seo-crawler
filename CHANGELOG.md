@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.9.4
+- added Page Types analysis tab with editable regex rules
+- automatically summarizes URL count, average crawl depth, average unique inlinks/outlinks, 200 OK count and indexable URLs by page type
+- automatically builds a page-type internal link map (Source Page Type -> Target Page Type)
+- shows main incoming/outgoing page types and supports CSV export for summary, link map and classified URLs
+
+
 ## v1.9.3
 - Include Regex crawl scope: start URL is crawled as the seed, then only matching internal URLs are queued
 - dedicated SEO Spider-style CSV exports for Internal HTML, All Inlinks, All Outlinks, Canonicals, Directives, Response Codes, Page Titles, Meta Description, H1, H2 and Crawl Depth
