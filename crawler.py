@@ -2,6 +2,7 @@ import argparse
 import csv
 import ipaddress
 import json
+import re
 import socket
 import sqlite3
 import time
@@ -46,7 +47,7 @@ SKIP_EXTENSIONS = (
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 )
 
-USER_AGENT = "Mozilla/5.0 (compatible; FRUSTWAY-SEOCrawler/1.9.2)"
+USER_AGENT = "Mozilla/5.0 (compatible; FRUSTWAY-SEOCrawler/1.9.3)"
 
 
 class PublicTargetBlocked(ValueError):
@@ -744,6 +745,7 @@ def crawl(
     public_mode=False,
     max_depth=None,
     adaptive_backoff=True,
+    include_pattern="",
 ):
     start_url = normalize_url(start_url, start_url)
 
@@ -763,6 +765,32 @@ def crawl(
 
         if max_depth < 0:
             raise ValueError("max_depth must be 0 or greater")
+
+    include_pattern = str(
+        include_pattern or ""
+    ).strip()
+
+    include_regex = None
+
+    if include_pattern:
+        try:
+            include_regex = re.compile(
+                include_pattern
+            )
+        except re.error as exc:
+            raise ValueError(
+                f"Include Regexが不正です: {exc}"
+            ) from exc
+
+    def url_is_included(url):
+        if include_regex is None:
+            return True
+
+        return bool(
+            include_regex.search(
+                str(url)
+            )
+        )
 
     root_hostname = urlsplit(start_url).hostname
 
@@ -826,7 +854,7 @@ def crawl(
 
     print()
     print("======================================")
-    print(" FRUSTWAY SEO Crawler v1.9.2")
+    print(" FRUSTWAY SEO Crawler v1.9.3")
     print("======================================")
     print(f"Start URL    : {start_url}")
     print(f"Max pages    : {max_pages}")
@@ -843,6 +871,14 @@ def crawl(
         )
     )
     print(f"Backoff      : {adaptive_backoff}")
+    print(
+        "Include regex: "
+        + (
+            include_pattern
+            if include_pattern
+            else "Entire site"
+        )
+    )
     print(f"Database     : {db_path}")
     print()
 
@@ -953,6 +989,7 @@ def crawl(
                         if (
                             same_site(redirect_url, root_hostname)
                             and is_crawlable_url(redirect_url)
+                            and url_is_included(redirect_url)
                             and redirect_url not in visited
                             and redirect_url not in queued
                         ):
@@ -1071,6 +1108,7 @@ def crawl(
                     if (
                         internal
                         and is_crawlable_url(target)
+                        and url_is_included(target)
                         and target not in visited
                         and target not in queued
                         and (
@@ -1590,6 +1628,15 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--include-regex",
+        default="",
+        help=(
+            "開始URL以外でクロール対象にするURLの正規表現。"
+            "例: ^https://example.com/notebook/.*"
+        ),
+    )
+
     args = parser.parse_args()
 
     conn = crawl(
@@ -1603,6 +1650,7 @@ def main():
         public_mode=args.public_mode,
         max_depth=args.max_depth,
         adaptive_backoff=True,
+        include_pattern=args.include_regex,
     )
 
     export_csv(conn, args.csv)
