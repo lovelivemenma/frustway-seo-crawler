@@ -337,6 +337,10 @@ if previous_job != JOB_ID:
         "prepared_spider_export_path",
         "prepared_spider_export_name",
         "prepared_spider_export_rows",
+        "page_type_classified",
+        "page_type_summary",
+        "page_type_transitions",
+        "page_type_rule_errors",
     ]:
         st.session_state.pop(
             key,
@@ -374,7 +378,7 @@ META_PATH = str(
 init_crawl_state()
 
 st.title(APP_TITLE)
-st.caption("HTML SEO監査用クローラー v1.9.3 Browser Release")
+st.caption("HTML SEO監査用クローラー v1.9.4 Browser Release")
 
 initial_crawl_state = get_crawl_snapshot()
 crawl_running = bool(
@@ -1277,6 +1281,442 @@ def prepare_spider_export(
     )
 
 
+DEFAULT_PAGE_TYPE_RULES = r"""
+# First match wins. Format: Page Type => Python Regex
+TOP => ^https?://[^/]+/?(?:\\?.*)?$
+Notebook => ^https?://[^/]+/notebook(?:/.*)?$
+Matome => ^https?://[^/]+/matome(?:/.*)?$
+Area x Style => ^https?://[^/]+/[^/]+/area\\d+/style\\d+/?(?:\\?.*)?$
+Area => ^https?://[^/]+/[^/]+/area\\d+/?(?:\\?.*)?$
+Prefecture x Style => ^https?://[^/]+/[^/]+/style\\d+/?(?:\\?.*)?$
+First-level Directory => ^https?://[^/]+/[^/]+/?(?:\\?.*)?$
+""".strip()
+
+
+def parse_page_type_rules(rule_text):
+    compiled = []
+    errors = []
+
+    for line_no, raw_line in enumerate(
+        str(rule_text or "").splitlines(),
+        start=1,
+    ):
+        line = raw_line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if "=>" not in line:
+            errors.append(
+                f"Line {line_no}: 'Page Type => Regex' の形式で入力してください。"
+            )
+            continue
+
+        label, pattern = line.split(
+            "=>",
+            1,
+        )
+
+        label = label.strip()
+        pattern = pattern.strip()
+
+        if not label or not pattern:
+            errors.append(
+                f"Line {line_no}: Page TypeまたはRegexが空です。"
+            )
+            continue
+
+        try:
+            regex = re.compile(
+                pattern
+            )
+        except re.error as exc:
+            errors.append(
+                f"Line {line_no} ({label}): {exc}"
+            )
+            continue
+
+        compiled.append(
+            (
+                label,
+                pattern,
+                regex,
+            )
+        )
+
+    if not compiled and not errors:
+        errors.append(
+            "Page Typeルールがありません。"
+        )
+
+    return compiled, errors
+
+
+def classify_page_type(
+    url,
+    compiled_rules,
+):
+    value = str(url or "")
+
+    for label, pattern, regex in compiled_rules:
+        if regex.search(value):
+            return label, pattern
+
+    return "Other / Unclassified", ""
+
+
+def build_page_type_analysis(
+    crawl_df,
+    db_path,
+    compiled_rules,
+):
+    classified_df = crawl_df.copy()
+
+    classifications = [
+        classify_page_type(
+            url,
+            compiled_rules,
+        )
+        for url in classified_df[
+            "URL"
+        ].fillna("")
+    ]
+
+    classified_df[
+        "Page Type"
+    ] = [
+        item[0]
+        for item in classifications
+    ]
+
+    classified_df[
+        "Matched Rule"
+    ] = [
+        item[1]
+        for item in classifications
+    ]
+
+    for column in (
+        "Depth",
+        "Unique Internal Inlinks",
+        "Unique Internal Outlinks",
+    ):
+        if column not in classified_df.columns:
+            classified_df[column] = 0
+
+        classified_df[
+            column
+        ] = pd.to_numeric(
+            classified_df[column],
+            errors="coerce",
+        ).fillna(0)
+
+    if "Status" not in classified_df.columns:
+        classified_df["Status"] = 0
+
+    classified_df[
+        "_status_numeric"
+    ] = pd.to_numeric(
+        classified_df["Status"],
+        errors="coerce",
+    ).fillna(0)
+
+    if "Indexable" not in classified_df.columns:
+        classified_df["Indexable"] = ""
+
+    grouped = (
+        classified_df.groupby(
+            "Page Type",
+            dropna=False,
+        )
+        .agg(
+            **{
+                "URL Count": (
+                    "URL",
+                    "count",
+                ),
+                "Avg Depth": (
+                    "Depth",
+                    "mean",
+                ),
+                "Avg Unique Inlinks": (
+                    "Unique Internal Inlinks",
+                    "mean",
+                ),
+                "Avg Unique Outlinks": (
+                    "Unique Internal Outlinks",
+                    "mean",
+                ),
+                "200 OK": (
+                    "_status_numeric",
+                    lambda x: int(
+                        (x == 200).sum()
+                    ),
+                ),
+                "Indexable URLs": (
+                    "Indexable",
+                    lambda x: int(
+                        (
+                            x.fillna("")
+                            == "Yes"
+                        ).sum()
+                    ),
+                ),
+                "Sample URL": (
+                    "URL",
+                    "first",
+                ),
+                "URL Pattern": (
+                    "Matched Rule",
+                    "first",
+                ),
+            }
+        )
+        .reset_index()
+    )
+
+    grouped[
+        "Avg Depth"
+    ] = grouped[
+        "Avg Depth"
+    ].round(2)
+
+    grouped[
+        "Avg Unique Inlinks"
+    ] = grouped[
+        "Avg Unique Inlinks"
+    ].round(2)
+
+    grouped[
+        "Avg Unique Outlinks"
+    ] = grouped[
+        "Avg Unique Outlinks"
+    ].round(2)
+
+    conn = db_connect(
+        db_path
+    )
+
+    try:
+        conn.execute(
+            """
+            CREATE TEMP TABLE IF NOT EXISTS page_type_map (
+                url TEXT PRIMARY KEY,
+                page_type TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            "DELETE FROM page_type_map"
+        )
+
+        page_type_rows = [
+            (
+                str(row["URL"]),
+                str(row["Page Type"]),
+            )
+            for _, row in classified_df[
+                [
+                    "URL",
+                    "Page Type",
+                ]
+            ].iterrows()
+        ]
+
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO page_type_map (
+                url,
+                page_type
+            )
+            VALUES (?, ?)
+            """,
+            page_type_rows,
+        )
+
+        cursor = conn.execute(
+            """
+            SELECT DISTINCT l.target_url
+            FROM links l
+            LEFT JOIN page_type_map p
+                ON p.url = l.target_url
+            WHERE l.is_internal = 1
+              AND p.url IS NULL
+            """
+        )
+
+        while True:
+            targets = cursor.fetchmany(
+                5000
+            )
+
+            if not targets:
+                break
+
+            target_rows = []
+
+            for (target_url,) in targets:
+                page_type, _ = (
+                    classify_page_type(
+                        target_url,
+                        compiled_rules,
+                    )
+                )
+
+                target_rows.append(
+                    (
+                        str(target_url),
+                        page_type,
+                    )
+                )
+
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO page_type_map (
+                    url,
+                    page_type
+                )
+                VALUES (?, ?)
+                """,
+                target_rows,
+            )
+
+        transitions_df = pd.read_sql_query(
+            """
+            SELECT
+                COALESCE(
+                    s.page_type,
+                    'Other / Unclassified'
+                ) AS "Source Page Type",
+                COALESCE(
+                    t.page_type,
+                    'Other / Unclassified'
+                ) AS "Target Page Type",
+                COUNT(*) AS "Links",
+                COUNT(
+                    DISTINCT l.source_url
+                ) AS "Unique Source URLs",
+                COUNT(
+                    DISTINCT l.target_url
+                ) AS "Unique Target URLs"
+            FROM links l
+            LEFT JOIN page_type_map s
+                ON s.url = l.source_url
+            LEFT JOIN page_type_map t
+                ON t.url = l.target_url
+            WHERE l.is_internal = 1
+            GROUP BY
+                COALESCE(
+                    s.page_type,
+                    'Other / Unclassified'
+                ),
+                COALESCE(
+                    t.page_type,
+                    'Other / Unclassified'
+                )
+            ORDER BY
+                COUNT(*) DESC,
+                "Source Page Type",
+                "Target Page Type"
+            """,
+            conn,
+        )
+
+    finally:
+        conn.close()
+
+    if transitions_df.empty:
+        grouped[
+            "Main Link Sources"
+        ] = ""
+        grouped[
+            "Main Link Targets"
+        ] = ""
+
+        return (
+            classified_df,
+            grouped,
+            transitions_df,
+        )
+
+    source_lookup = {}
+    target_lookup = {}
+
+    for page_type in grouped[
+        "Page Type"
+    ].astype(str):
+        incoming = (
+            transitions_df[
+                transitions_df[
+                    "Target Page Type"
+                ].astype(str)
+                == page_type
+            ]
+            .sort_values(
+                "Links",
+                ascending=False,
+            )
+            .head(3)
+        )
+
+        outgoing = (
+            transitions_df[
+                transitions_df[
+                    "Source Page Type"
+                ].astype(str)
+                == page_type
+            ]
+            .sort_values(
+                "Links",
+                ascending=False,
+            )
+            .head(3)
+        )
+
+        source_lookup[
+            page_type
+        ] = " | ".join(
+            (
+                f"{row['Source Page Type']} "
+                f"({int(row['Links']):,})"
+            )
+            for _, row in incoming.iterrows()
+        )
+
+        target_lookup[
+            page_type
+        ] = " | ".join(
+            (
+                f"{row['Target Page Type']} "
+                f"({int(row['Links']):,})"
+            )
+            for _, row in outgoing.iterrows()
+        )
+
+    grouped[
+        "Main Link Sources"
+    ] = grouped[
+        "Page Type"
+    ].astype(str).map(
+        source_lookup
+    ).fillna("")
+
+    grouped[
+        "Main Link Targets"
+    ] = grouped[
+        "Page Type"
+    ].astype(str).map(
+        target_lookup
+    ).fillna("")
+
+    return (
+        classified_df,
+        grouped,
+        transitions_df,
+    )
+
+
 def short_url_label(url, is_root=False):
     """
     Site Structure用表示。
@@ -1809,6 +2249,10 @@ def start_crawl_job(
         "prepared_spider_export_path",
         "prepared_spider_export_name",
         "prepared_spider_export_rows",
+        "page_type_classified",
+        "page_type_summary",
+        "page_type_transitions",
+        "page_type_rule_errors",
     ]:
         st.session_state.pop(
             key,
@@ -2451,6 +2895,7 @@ tabs = st.tabs(
         "Page Titles",
         "Headings",
         "Site Structure",
+        "Page Types",
         "Canonicals",
         "Issues",
     ]
@@ -2463,6 +2908,7 @@ tabs = st.tabs(
     tab_titles,
     tab_headings,
     tab_structure,
+    tab_page_types,
     tab_canonical,
     tab_issues,
 ) = tabs
@@ -2873,6 +3319,234 @@ with tab_structure:
             hide_index=True,
             height=600,
         )
+
+
+with tab_page_types:
+    st.caption(
+        "URLパターンからページタイプを分類し、"
+        "URL数・平均Depth・平均Inlinks/Outlinks・"
+        "主なリンク元/リンク先を自動集計します。"
+    )
+
+    rule_text = st.text_area(
+        "Page Type Rules",
+        value=DEFAULT_PAGE_TYPE_RULES,
+        height=250,
+        key="page_type_rules",
+        help=(
+            "上から順に最初に一致したルールを採用します。"
+            "形式: Page Type => Python Regex"
+        ),
+    )
+
+    st.caption(
+        "デフォルトは汎用ルールです。"
+        "店舗詳細・女の子詳細・ホテル等は、"
+        "対象サイトのURLパターンが分かれば上に追記してください。"
+    )
+
+    if st.button(
+        "Analyze Page Types",
+        type="primary",
+        use_container_width=True,
+        key="analyze_page_types",
+    ):
+        compiled_rules, rule_errors = (
+            parse_page_type_rules(
+                rule_text
+            )
+        )
+
+        st.session_state[
+            "page_type_rule_errors"
+        ] = rule_errors
+
+        if not rule_errors:
+            with st.spinner(
+                "ページタイプと内部リンク構造を集計しています..."
+            ):
+                (
+                    classified_pages,
+                    page_type_summary,
+                    page_type_transitions,
+                ) = build_page_type_analysis(
+                    df,
+                    DB_PATH,
+                    compiled_rules,
+                )
+
+            st.session_state[
+                "page_type_classified"
+            ] = classified_pages
+            st.session_state[
+                "page_type_summary"
+            ] = page_type_summary
+            st.session_state[
+                "page_type_transitions"
+            ] = page_type_transitions
+
+    rule_errors = st.session_state.get(
+        "page_type_rule_errors",
+        [],
+    )
+
+    if rule_errors:
+        for error in rule_errors:
+            st.error(
+                error
+            )
+
+    page_type_summary = st.session_state.get(
+        "page_type_summary"
+    )
+    page_type_transitions = st.session_state.get(
+        "page_type_transitions"
+    )
+    classified_pages = st.session_state.get(
+        "page_type_classified"
+    )
+
+    if (
+        isinstance(
+            page_type_summary,
+            pd.DataFrame,
+        )
+        and not page_type_summary.empty
+    ):
+        st.markdown(
+            "#### Page Type Summary"
+        )
+
+        st.dataframe(
+            page_type_summary,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        summary_cols = st.columns(2)
+
+        summary_cols[
+            0
+        ].download_button(
+            "Download Page Type Summary CSV",
+            data=(
+                page_type_summary
+                .to_csv(
+                    index=False
+                )
+                .encode(
+                    "utf-8-sig"
+                )
+            ),
+            file_name=(
+                "page_type_summary.csv"
+            ),
+            mime="text/csv",
+            use_container_width=True,
+            key="download_page_type_summary",
+        )
+
+        if (
+            isinstance(
+                page_type_transitions,
+                pd.DataFrame,
+            )
+            and not page_type_transitions.empty
+        ):
+            summary_cols[
+                1
+            ].download_button(
+                "Download Link Map CSV",
+                data=(
+                    page_type_transitions
+                    .to_csv(
+                        index=False
+                    )
+                    .encode(
+                        "utf-8-sig"
+                    )
+                ),
+                file_name=(
+                    "page_type_link_map.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_page_type_link_map",
+            )
+
+            st.markdown(
+                "#### Page Type Link Map"
+            )
+
+            st.caption(
+                "Source Page Type → Target Page Type の"
+                "内部リンク本数と、リンク元/リンク先URL数です。"
+            )
+
+            st.dataframe(
+                page_type_transitions,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if (
+            isinstance(
+                classified_pages,
+                pd.DataFrame,
+            )
+            and not classified_pages.empty
+        ):
+            st.markdown(
+                "#### Classified URLs"
+            )
+
+            classified_cols = [
+                "Page Type",
+                "URL",
+                "Depth",
+                "Unique Internal Inlinks",
+                "Unique Internal Outlinks",
+                "Status",
+                "Indexable",
+                "Title",
+                "Matched Rule",
+            ]
+
+            classified_cols = [
+                col
+                for col in classified_cols
+                if col in classified_pages.columns
+            ]
+
+            st.dataframe(
+                classified_pages[
+                    classified_cols
+                ],
+                use_container_width=True,
+                hide_index=True,
+                height=500,
+            )
+
+            st.download_button(
+                "Download Classified URLs CSV",
+                data=(
+                    classified_pages[
+                        classified_cols
+                    ]
+                    .to_csv(
+                        index=False
+                    )
+                    .encode(
+                        "utf-8-sig"
+                    )
+                ),
+                file_name=(
+                    "classified_urls.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_classified_urls",
+            )
 
 
 with tab_canonical:
