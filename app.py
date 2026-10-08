@@ -17,6 +17,7 @@ import release_runtime as release_runtime
 
 
 APP_TITLE = "FRUSTWAY SEO Crawler"
+# deploy-refresh: 2026-10-08 v1.9.4
 
 PUBLIC_MODE = (
     os.environ.get(
