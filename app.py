@@ -1283,13 +1283,13 @@ def prepare_spider_export(
 
 DEFAULT_PAGE_TYPE_RULES = r"""
 # First match wins. Format: Page Type => Python Regex
-TOP => ^https?://[^/]+/?(?:\\?.*)?$
-Notebook => ^https?://[^/]+/notebook(?:/.*)?$
-Matome => ^https?://[^/]+/matome(?:/.*)?$
-Area x Style => ^https?://[^/]+/[^/]+/area\\d+/style\\d+/?(?:\\?.*)?$
-Area => ^https?://[^/]+/[^/]+/area\\d+/?(?:\\?.*)?$
-Prefecture x Style => ^https?://[^/]+/[^/]+/style\\d+/?(?:\\?.*)?$
-First-level Directory => ^https?://[^/]+/[^/]+/?(?:\\?.*)?$
+TOP => ^https?://[^/]+/?(?:\?.*)?$
+雑記帳 => ^https?://[^/]+/notebook(?:/.*)?$
+風俗まとめ => ^https?://[^/]+/matome(?:/.*)?$
+エリア×業種 => ^https?://[^/]+/[^/]+/area\d+/style\d+/?(?:\?.*)?$
+エリア総合 => ^https?://[^/]+/[^/]+/area\d+/?(?:\?.*)?$
+都道府県×業種 => ^https?://[^/]+/[^/]+/style\d+/?(?:\?.*)?$
+第1階層（要分類） => ^https?://[^/]+/[^/]+/?(?:\?.*)?$
 """.strip()
 
 
@@ -1411,6 +1411,116 @@ def build_page_type_analysis(
             errors="coerce",
         ).fillna(0)
 
+    conn = db_connect(
+        db_path
+    )
+
+    try:
+        link_count_df = pd.read_sql_query(
+            """
+            WITH inlinks AS (
+                SELECT
+                    target_url AS url,
+                    COUNT(*) AS internal_inlinks,
+                    COUNT(
+                        DISTINCT source_url
+                    ) AS unique_internal_inlinks
+                FROM links
+                WHERE is_internal = 1
+                GROUP BY target_url
+            ),
+            outlinks AS (
+                SELECT
+                    source_url AS url,
+                    COUNT(*) AS internal_outlinks,
+                    COUNT(
+                        DISTINCT target_url
+                    ) AS unique_internal_outlinks
+                FROM links
+                WHERE is_internal = 1
+                GROUP BY source_url
+            )
+            SELECT
+                p.url AS "URL",
+                COALESCE(
+                    i.internal_inlinks,
+                    0
+                ) AS "Internal Inlinks",
+                COALESCE(
+                    i.unique_internal_inlinks,
+                    0
+                ) AS "Unique Internal Inlinks DB",
+                COALESCE(
+                    o.internal_outlinks,
+                    0
+                ) AS "Internal Outlinks",
+                COALESCE(
+                    o.unique_internal_outlinks,
+                    0
+                ) AS "Unique Internal Outlinks DB"
+            FROM pages p
+            LEFT JOIN inlinks i
+                ON i.url = p.url
+            LEFT JOIN outlinks o
+                ON o.url = p.url
+            """,
+            conn,
+        )
+    finally:
+        conn.close()
+
+    classified_df = classified_df.merge(
+        link_count_df,
+        on="URL",
+        how="left",
+    )
+
+    classified_df[
+        "Unique Internal Inlinks"
+    ] = pd.to_numeric(
+        classified_df[
+            "Unique Internal Inlinks DB"
+        ],
+        errors="coerce",
+    ).fillna(
+        classified_df[
+            "Unique Internal Inlinks"
+        ]
+    )
+
+    classified_df[
+        "Unique Internal Outlinks"
+    ] = pd.to_numeric(
+        classified_df[
+            "Unique Internal Outlinks DB"
+        ],
+        errors="coerce",
+    ).fillna(
+        classified_df[
+            "Unique Internal Outlinks"
+        ]
+    )
+
+    for column in (
+        "Internal Inlinks",
+        "Internal Outlinks",
+    ):
+        classified_df[
+            column
+        ] = pd.to_numeric(
+            classified_df[column],
+            errors="coerce",
+        ).fillna(0)
+
+    classified_df.drop(
+        columns=[
+            "Unique Internal Inlinks DB",
+            "Unique Internal Outlinks DB",
+        ],
+        inplace=True,
+        errors="ignore",
+    )
+
     if "Status" not in classified_df.columns:
         classified_df["Status"] = 0
 
@@ -1439,8 +1549,16 @@ def build_page_type_analysis(
                     "Depth",
                     "mean",
                 ),
+                "Avg Inlinks": (
+                    "Internal Inlinks",
+                    "mean",
+                ),
                 "Avg Unique Inlinks": (
                     "Unique Internal Inlinks",
+                    "mean",
+                ),
+                "Avg Outlinks": (
+                    "Internal Outlinks",
                     "mean",
                 ),
                 "Avg Unique Outlinks": (
@@ -1481,17 +1599,17 @@ def build_page_type_analysis(
         "Avg Depth"
     ].round(2)
 
-    grouped[
-        "Avg Unique Inlinks"
-    ] = grouped[
-        "Avg Unique Inlinks"
-    ].round(2)
-
-    grouped[
-        "Avg Unique Outlinks"
-    ] = grouped[
-        "Avg Unique Outlinks"
-    ].round(2)
+    for column in (
+        "Avg Inlinks",
+        "Avg Unique Inlinks",
+        "Avg Outlinks",
+        "Avg Unique Outlinks",
+    ):
+        grouped[
+            column
+        ] = grouped[
+            column
+        ].round(2)
 
     conn = db_connect(
         db_path
@@ -3504,7 +3622,9 @@ with tab_page_types:
                 "Page Type",
                 "URL",
                 "Depth",
+                "Internal Inlinks",
                 "Unique Internal Inlinks",
+                "Internal Outlinks",
                 "Unique Internal Outlinks",
                 "Status",
                 "Indexable",
