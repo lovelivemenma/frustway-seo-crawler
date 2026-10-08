@@ -16,7 +16,7 @@ _MAX_CONCURRENT = max(
     int(
         os.environ.get(
             "FRUSTWAY_MAX_CONCURRENT_CRAWLS",
-            "2",
+            "1",
         )
     ),
 )
