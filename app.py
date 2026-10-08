@@ -288,6 +288,152 @@ def get_crawl_snapshot():
         )
 
 
+def load_crawl_history():
+    root = Path(
+        JOBS_ROOT
+    )
+
+    if not root.exists():
+        return []
+
+    items = []
+
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+
+        job_id = (
+            release_runtime
+            .normalize_job_id(
+                child.name
+            )
+        )
+
+        if not job_id:
+            continue
+
+        meta = load_crawl_meta(
+            child
+            / "crawl_meta.json"
+        ) or {}
+
+        try:
+            modified = (
+                child.stat().st_mtime
+            )
+        except OSError:
+            modified = 0.0
+
+        crawled = int(
+            meta.get(
+                "crawled"
+            )
+            or 0
+        )
+
+        db_path = (
+            child
+            / "seo.db"
+        )
+
+        if (
+            crawled == 0
+            and db_path.exists()
+        ):
+            try:
+                conn = sqlite3.connect(
+                    str(db_path),
+                    timeout=2,
+                )
+
+                crawled = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM pages
+                        """
+                    ).fetchone()[0]
+                )
+
+                conn.close()
+            except Exception:
+                pass
+
+        event = str(
+            meta.get(
+                "event"
+            )
+            or ""
+        ).strip()
+
+        error = str(
+            meta.get(
+                "error"
+            )
+            or ""
+        ).strip()
+
+        if error:
+            status = "Error"
+        elif event == "limit_reached":
+            status = "Limit reached"
+        elif event == "stopped":
+            status = "Stopped"
+        elif event == "complete":
+            status = "Complete"
+        elif meta.get("finished"):
+            status = "Finished"
+        elif crawled:
+            status = "Saved"
+        else:
+            status = "New"
+
+        items.append(
+            {
+                "job_id": job_id,
+                "modified": modified,
+                "last_used": (
+                    time.strftime(
+                        "%m/%d %H:%M",
+                        time.localtime(
+                            modified
+                        ),
+                    )
+                    if modified
+                    else "-"
+                ),
+                "start_url": str(
+                    meta.get(
+                        "start_url"
+                    )
+                    or ""
+                ),
+                "crawled": crawled,
+                "status": status,
+                "include_pattern": str(
+                    meta.get(
+                        "include_pattern"
+                    )
+                    or ""
+                ),
+                "max_depth": meta.get(
+                    "max_depth"
+                ),
+            }
+        )
+
+    items.sort(
+        key=lambda item: (
+            item[
+                "modified"
+            ]
+        ),
+        reverse=True,
+    )
+
+    return items
+
+
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="🔎",
@@ -379,7 +525,7 @@ META_PATH = str(
 init_crawl_state()
 
 st.title(APP_TITLE)
-st.caption("HTML SEO監査用クローラー v1.9.4 Browser Release")
+st.caption("HTML SEO監査用クローラー v1.9.5 Browser Release")
 
 initial_crawl_state = get_crawl_snapshot()
 crawl_running = bool(
@@ -388,231 +534,421 @@ crawl_running = bool(
 
 
 with st.sidebar:
-    st.header("Crawl Settings")
-
-    if PUBLIC_MODE:
-        st.caption(
-            "Browser Beta"
-            f" · Max {PUBLIC_MAX_PAGES:,} URLs"
-            f" · Jobs retained {JOB_TTL_HOURS}h"
-        )
-    else:
-        st.caption(
-            "Local Mode"
-            f" · Max {LOCAL_MAX_PAGES:,} URLs"
-        )
-
-    st.caption(
-        f"Job: {JOB_ID[:8]}"
-    )
-
-    if st.button(
-        "New Job",
-        use_container_width=True,
-        disabled=crawl_running,
-    ):
-        new_job_id = (
-            release_runtime.new_job_id()
-        )
-        st.query_params["job"] = (
-            new_job_id
-        )
-        st.rerun()
-
-    start_url = st.text_input(
-        "Start URL",
-        value=(
-            ""
-            if PUBLIC_MODE
-            else "https://kamakura-wedding.jp/"
-        ),
-        placeholder="https://example.com/",
-        disabled=crawl_running,
-    )
-
-    max_pages_allowed = (
-        PUBLIC_MAX_PAGES
-        if PUBLIC_MODE
-        else LOCAL_MAX_PAGES
-    )
-
-    max_pages = st.number_input(
-        "Max pages",
-        min_value=1,
-        max_value=max_pages_allowed,
-        value=min(
-            1000,
-            max_pages_allowed,
-        ),
-        step=100,
-        disabled=crawl_running,
-    )
-
-    limit_depth = st.checkbox(
-        "Limit crawl depth",
-        value=False,
-        disabled=crawl_running,
-        help=(
-            "Depth 0は開始URLです。"
-            "3を指定するとDepth 0〜3までクロールし、"
-            "Depth 4以降はキューへ追加しません。"
-        ),
-    )
-
-    max_depth_value = st.number_input(
-        "Max crawl depth",
-        min_value=0,
-        max_value=20,
-        value=3,
-        step=1,
-        disabled=(
-            crawl_running
-            or not limit_depth
-        ),
-    )
-
-    max_depth = (
-        int(max_depth_value)
-        if limit_depth
-        else None
-    )
-
-    crawl_scope = st.selectbox(
-        "Crawl scope",
+    settings_tab, history_tab = st.tabs(
         [
-            "Entire site",
-            "Include Regex",
-        ],
-        index=0,
-        disabled=crawl_running,
-        help=(
-            "Include Regexでは開始URLを入口として1回取得し、"
-            "その後は正規表現に一致する内部URLだけをクロールします。"
-            "リンク自体は一致・不一致にかかわらず保存します。"
-        ),
+            "Settings",
+            "Crawl History",
+        ]
     )
 
-    include_pattern = ""
+    with settings_tab:
+        st.header("Crawl Settings")
 
-    if crawl_scope == "Include Regex":
-        include_pattern = st.text_area(
-            "Include URL Regex",
-            value="",
-            placeholder=(
-                r"^https://ranking-deli\.jp/notebook/.*"
-            ),
-            height=90,
+        if PUBLIC_MODE:
+            st.caption(
+                "Browser Beta"
+                f" · Max {PUBLIC_MAX_PAGES:,} URLs"
+                f" · Jobs retained {JOB_TTL_HOURS}h"
+            )
+        else:
+            st.caption(
+                "Local Mode"
+                f" · Max {LOCAL_MAX_PAGES:,} URLs"
+            )
+
+        st.caption(
+            f"Job: {JOB_ID[:8]}"
+        )
+
+        if st.button(
+            "New Job",
+            use_container_width=True,
             disabled=crawl_running,
-            help=(
-                "Python正規表現です。"
-                "例: ^https://ranking-deli\\.jp/notebook/.*"
+        ):
+            new_job_id = (
+                release_runtime.new_job_id()
+            )
+            st.query_params["job"] = (
+                new_job_id
+            )
+            st.rerun()
+
+        start_url = st.text_input(
+            "Start URL",
+            value=(
+                ""
+                if PUBLIC_MODE
+                else "https://kamakura-wedding.jp/"
             ),
-        ).strip()
-
-        st.caption(
-            "開始URLはシードとして取得します。"
-            "2URL目以降はこのRegexに一致するURLだけをキューへ追加します。"
+            placeholder="https://example.com/",
+            disabled=crawl_running,
         )
 
-    polite_mode = st.checkbox(
-        "Polite crawl mode",
-        value=True,
-        disabled=crawl_running,
-        help=(
-            "対象サーバーへの負荷を抑える推奨設定です。"
-            "1クロール内は直列アクセスのまま、"
-            "最低1秒の間隔を取り、429/5xx時は自動で待機します。"
-        ),
-    )
-
-    delay_min = (
-        1.0
-        if polite_mode
-        else (
-            0.2
+        max_pages_allowed = (
+            PUBLIC_MAX_PAGES
             if PUBLIC_MODE
-            else 0.0
-        )
-    )
-
-    delay_default = (
-        1.0
-        if polite_mode
-        else 0.3
-    )
-
-    delay = st.number_input(
-        "Delay (seconds)",
-        min_value=float(delay_min),
-        max_value=10.0,
-        value=float(delay_default),
-        step=0.1,
-        disabled=crawl_running,
-    )
-
-    if polite_mode:
-        st.caption(
-            "負荷軽減: 直列アクセス / 最低1秒間隔 / "
-            "429・502・503・504で最大60秒の自動バックオフ"
+            else LOCAL_MAX_PAGES
         )
 
-    heading_label = st.selectbox(
-        "Heading extraction",
-        [
-            "Title + H1 only",
-            "Full outline (H1-H6)",
-        ],
-        index=0,
-        help=(
-            "通常監査はTitle + H1のみ。"
-            "構成監査を行う場合はFull outlineを選択してください。"
-        ),
-        disabled=crawl_running,
-    )
-
-    heading_mode = (
-        "full"
-        if heading_label == "Full outline (H1-H6)"
-        else "basic"
-    )
-
-    st.markdown("##### Storage")
-
-    if PUBLIC_MODE:
-        store_body_text = False
-        store_external_links = False
-
-        st.caption(
-            "Browser版では安定性のため、"
-            "本文保存・外部リンク保存はOFF固定です。"
+        max_pages = st.number_input(
+            "Max pages",
+            min_value=1,
+            max_value=max_pages_allowed,
+            value=min(
+                1000,
+                max_pages_allowed,
+            ),
+            step=100,
+            disabled=crawl_running,
         )
-    else:
-        store_body_text = st.checkbox(
-            "Store body text in DB",
+
+        limit_depth = st.checkbox(
+            "Limit crawl depth",
             value=False,
             disabled=crawl_running,
             help=(
-                "OFF推奨。文字数は取得しますが本文自体は保存しません。"
+                "Depth 0は開始URLです。"
+                "3を指定するとDepth 0〜3までクロールし、"
+                "Depth 4以降はキューへ追加しません。"
             ),
         )
 
-        store_external_links = st.checkbox(
-            "Store external links",
-            value=False,
+        max_depth_value = st.number_input(
+            "Max crawl depth",
+            min_value=0,
+            max_value=20,
+            value=3,
+            step=1,
+            disabled=(
+                crawl_running
+                or not limit_depth
+            ),
+        )
+
+        max_depth = (
+            int(max_depth_value)
+            if limit_depth
+            else None
+        )
+
+        crawl_scope = st.selectbox(
+            "Crawl scope",
+            [
+                "Entire site",
+                "Include Regex",
+            ],
+            index=0,
             disabled=crawl_running,
             help=(
-                "OFF推奨。Site Structure / Internal Links解析には"
-                "内部リンクだけで十分です。"
+                "Include Regexでは開始URLを入口として1回取得し、"
+                "その後は正規表現に一致する内部URLだけをクロールします。"
+                "リンク自体は一致・不一致にかかわらず保存します。"
             ),
         )
 
-    run_crawl = st.button(
-        "Start Crawl",
-        type="primary",
-        use_container_width=True,
-        disabled=crawl_running,
-    )
+        include_pattern = ""
 
+        if crawl_scope == "Include Regex":
+            include_pattern = st.text_area(
+                "Include URL Regex",
+                value="",
+                placeholder=(
+                    r"^https://ranking-deli\.jp/notebook/.*"
+                ),
+                height=90,
+                disabled=crawl_running,
+                help=(
+                    "Python正規表現です。"
+                    "例: ^https://ranking-deli\\.jp/notebook/.*"
+                ),
+            ).strip()
+
+            st.caption(
+                "開始URLはシードとして取得します。"
+                "2URL目以降はこのRegexに一致するURLだけをキューへ追加します。"
+            )
+
+        polite_mode = st.checkbox(
+            "Polite crawl mode",
+            value=True,
+            disabled=crawl_running,
+            help=(
+                "対象サーバーへの負荷を抑える推奨設定です。"
+                "1クロール内は直列アクセスのまま、"
+                "最低1秒の間隔を取り、429/5xx時は自動で待機します。"
+            ),
+        )
+
+        delay_min = (
+            1.0
+            if polite_mode
+            else (
+                0.2
+                if PUBLIC_MODE
+                else 0.0
+            )
+        )
+
+        delay_default = (
+            1.0
+            if polite_mode
+            else 0.3
+        )
+
+        delay = st.number_input(
+            "Delay (seconds)",
+            min_value=float(delay_min),
+            max_value=10.0,
+            value=float(delay_default),
+            step=0.1,
+            disabled=crawl_running,
+        )
+
+        if polite_mode:
+            st.caption(
+                "負荷軽減: 直列アクセス / 最低1秒間隔 / "
+                "429・502・503・504で最大60秒の自動バックオフ"
+            )
+
+        heading_label = st.selectbox(
+            "Heading extraction",
+            [
+                "Title + H1 only",
+                "Full outline (H1-H6)",
+            ],
+            index=0,
+            help=(
+                "通常監査はTitle + H1のみ。"
+                "構成監査を行う場合はFull outlineを選択してください。"
+            ),
+            disabled=crawl_running,
+        )
+
+        heading_mode = (
+            "full"
+            if heading_label == "Full outline (H1-H6)"
+            else "basic"
+        )
+
+        st.markdown("##### Storage")
+
+        if PUBLIC_MODE:
+            store_body_text = False
+            store_external_links = False
+
+            st.caption(
+                "Browser版では安定性のため、"
+                "本文保存・外部リンク保存はOFF固定です。"
+            )
+        else:
+            store_body_text = st.checkbox(
+                "Store body text in DB",
+                value=False,
+                disabled=crawl_running,
+                help=(
+                    "OFF推奨。文字数は取得しますが本文自体は保存しません。"
+                ),
+            )
+
+            store_external_links = st.checkbox(
+                "Store external links",
+                value=False,
+                disabled=crawl_running,
+                help=(
+                    "OFF推奨。Site Structure / Internal Links解析には"
+                    "内部リンクだけで十分です。"
+                ),
+            )
+
+        run_crawl = st.button(
+            "Start Crawl",
+            type="primary",
+            use_container_width=True,
+            disabled=crawl_running,
+        )
+
+
+
+    with history_tab:
+        history_items = (
+            load_crawl_history()
+        )
+
+        st.caption(
+            "このインスタンスに残っているJobを表示します。"
+        )
+
+        if PUBLIC_MODE:
+            st.caption(
+                f"保持目安: {JOB_TTL_HOURS}時間。"
+                "Streamlit再起動で消える場合があります。"
+            )
+
+        if not history_items:
+            st.info(
+                "保存済みのCrawl Jobはありません。"
+            )
+        else:
+            history_labels = {
+                item["job_id"]: (
+                    (
+                        "● "
+                        if item[
+                            "job_id"
+                        ] == JOB_ID
+                        else ""
+                    )
+                    + f"{item['last_used']} · "
+                    + f"{item['crawled']:,}p · "
+                    + item[
+                        "status"
+                    ]
+                    + (
+                        " · "
+                        + item[
+                            "start_url"
+                        ][:42]
+                        if item[
+                            "start_url"
+                        ]
+                        else ""
+                    )
+                )
+                for item in history_items
+            }
+
+            history_ids = [
+                item[
+                    "job_id"
+                ]
+                for item in history_items
+            ]
+
+            history_default_index = (
+                history_ids.index(
+                    JOB_ID
+                )
+                if JOB_ID
+                in history_ids
+                else 0
+            )
+
+            selected_history_job = (
+                st.selectbox(
+                    "Saved Jobs",
+                    history_ids,
+                    index=(
+                        history_default_index
+                    ),
+                    format_func=lambda job_id: (
+                        history_labels.get(
+                            job_id,
+                            job_id[:8],
+                        )
+                    ),
+                    key="crawl_history_job",
+                )
+            )
+
+            selected_history = next(
+                (
+                    item
+                    for item
+                    in history_items
+                    if item[
+                        "job_id"
+                    ]
+                    == selected_history_job
+                ),
+                None,
+            )
+
+            if selected_history:
+                st.code(
+                    selected_history[
+                        "job_id"
+                    ],
+                    language=None,
+                )
+
+                if selected_history[
+                    "start_url"
+                ]:
+                    st.caption(
+                        "Start URL"
+                    )
+                    st.write(
+                        selected_history[
+                            "start_url"
+                        ]
+                    )
+
+                detail_parts = [
+                    (
+                        "Pages: "
+                        f"{selected_history['crawled']:,}"
+                    ),
+                    (
+                        "Status: "
+                        f"{selected_history['status']}"
+                    ),
+                ]
+
+                if (
+                    selected_history[
+                        "max_depth"
+                    ]
+                    is not None
+                ):
+                    detail_parts.append(
+                        "Max Depth: "
+                        f"{selected_history['max_depth']}"
+                    )
+
+                st.caption(
+                    " · ".join(
+                        detail_parts
+                    )
+                )
+
+                if selected_history[
+                    "include_pattern"
+                ]:
+                    st.caption(
+                        "Include Regex"
+                    )
+                    st.code(
+                        selected_history[
+                            "include_pattern"
+                        ],
+                        language=None,
+                    )
+
+                if (
+                    selected_history_job
+                    == JOB_ID
+                ):
+                    st.success(
+                        "現在開いているJobです。"
+                    )
+                else:
+                    if st.button(
+                        "Open selected Job",
+                        use_container_width=True,
+                        disabled=crawl_running,
+                        key="open_history_job",
+                    ):
+                        st.query_params[
+                            "job"
+                        ] = (
+                            selected_history_job
+                        )
+                        st.rerun()
+
+                    if crawl_running:
+                        st.caption(
+                            "クロール中はJob切替を無効にしています。"
+                        )
 
 def load_results(csv_path):
     path = Path(csv_path)
