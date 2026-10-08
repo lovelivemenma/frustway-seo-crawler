@@ -1,6 +1,8 @@
 from io import BytesIO
+import csv
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import threading
@@ -114,6 +116,7 @@ def save_crawl_meta(progress, meta_path=None):
         "heading_mode",
         "max_depth",
         "polite_mode",
+        "include_pattern",
     ]
 
     payload = {
@@ -221,6 +224,10 @@ def init_crawl_state():
                 "polite_mode",
                 True,
             )
+            saved.setdefault(
+                "include_pattern",
+                "",
+            )
             saved["needs_refresh"] = False
 
             st.session_state[
@@ -251,6 +258,7 @@ def init_crawl_state():
                 "heading_mode": "basic",
                 "max_depth": None,
                 "polite_mode": True,
+                "include_pattern": "",
                 "needs_refresh": False,
             }
 
@@ -326,6 +334,9 @@ if previous_job != JOB_ID:
         "crawl_thread",
         "prepared_excel_bytes",
         "prepared_excel_truncated",
+        "prepared_spider_export_path",
+        "prepared_spider_export_name",
+        "prepared_spider_export_rows",
     ]:
         st.session_state.pop(
             key,
@@ -363,7 +374,7 @@ META_PATH = str(
 init_crawl_state()
 
 st.title(APP_TITLE)
-st.caption("HTML SEO監査用クローラー v1.9.2 Browser Release")
+st.caption("HTML SEO監査用クローラー v1.9.3 Browser Release")
 
 initial_crawl_state = get_crawl_snapshot()
 crawl_running = bool(
@@ -460,6 +471,43 @@ with st.sidebar:
         if limit_depth
         else None
     )
+
+    crawl_scope = st.selectbox(
+        "Crawl scope",
+        [
+            "Entire site",
+            "Include Regex",
+        ],
+        index=0,
+        disabled=crawl_running,
+        help=(
+            "Include Regexでは開始URLを入口として1回取得し、"
+            "その後は正規表現に一致する内部URLだけをクロールします。"
+            "リンク自体は一致・不一致にかかわらず保存します。"
+        ),
+    )
+
+    include_pattern = ""
+
+    if crawl_scope == "Include Regex":
+        include_pattern = st.text_area(
+            "Include URL Regex",
+            value="",
+            placeholder=(
+                r"^https://ranking-deli\.jp/notebook/.*"
+            ),
+            height=90,
+            disabled=crawl_running,
+            help=(
+                "Python正規表現です。"
+                "例: ^https://ranking-deli\\.jp/notebook/.*"
+            ),
+        ).strip()
+
+        st.caption(
+            "開始URLはシードとして取得します。"
+            "2URL目以降はこのRegexに一致するURLだけをキューへ追加します。"
+        )
 
     polite_mode = st.checkbox(
         "Polite crawl mode",
@@ -1002,6 +1050,233 @@ def load_internal_links_for_export(
         conn.close()
 
 
+SPIDER_EXPORT_SPECS = {
+    "Internal > HTML": {
+        "filename": "internal_html.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                status_code AS "Status",
+                content_type AS "Content Type",
+                indexable AS "Indexable",
+                indexability_reason AS "Indexability Reason",
+                title AS "Title",
+                description AS "Meta Description",
+                h1 AS "H1",
+                h2 AS "H2",
+                depth AS "Crawl Depth",
+                canonical AS "Canonical"
+            FROM pages
+            WHERE LOWER(COALESCE(content_type, ''))
+                  LIKE 'text/html%'
+            ORDER BY id
+        """,
+    },
+    "All Inlinks": {
+        "filename": "all_inlinks.csv",
+        "sql": """
+            SELECT
+                l.target_url AS "Target URL",
+                l.source_url AS "Source URL",
+                COALESCE(l.anchor_text, '') AS "Anchor Text",
+                s.status_code AS "Source Status",
+                s.indexable AS "Source Indexable",
+                s.depth AS "Source Depth",
+                t.status_code AS "Target Status",
+                t.indexable AS "Target Indexable",
+                t.depth AS "Target Depth"
+            FROM links l
+            LEFT JOIN pages s ON s.url = l.source_url
+            LEFT JOIN pages t ON t.url = l.target_url
+            WHERE l.is_internal = 1
+            ORDER BY l.target_url, l.source_url, l.id
+        """,
+    },
+    "All Outlinks": {
+        "filename": "all_outlinks.csv",
+        "sql": """
+            SELECT
+                l.source_url AS "Source URL",
+                l.target_url AS "Target URL",
+                COALESCE(l.anchor_text, '') AS "Anchor Text",
+                s.status_code AS "Source Status",
+                s.indexable AS "Source Indexable",
+                s.depth AS "Source Depth",
+                t.status_code AS "Target Status",
+                t.indexable AS "Target Indexable",
+                t.depth AS "Target Depth"
+            FROM links l
+            LEFT JOIN pages s ON s.url = l.source_url
+            LEFT JOIN pages t ON t.url = l.target_url
+            WHERE l.is_internal = 1
+            ORDER BY l.source_url, l.target_url, l.id
+        """,
+    },
+    "Canonicals": {
+        "filename": "canonicals.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                status_code AS "Status",
+                canonical AS "Canonical",
+                canonical_match AS "Canonical Match",
+                indexable AS "Indexable",
+                indexability_reason AS "Indexability Reason"
+            FROM pages
+            ORDER BY id
+        """,
+    },
+    "Directives": {
+        "filename": "directives.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                status_code AS "Status",
+                robots AS "Meta Robots",
+                x_robots_tag AS "X-Robots-Tag",
+                indexable AS "Indexable",
+                indexability_reason AS "Indexability Reason"
+            FROM pages
+            ORDER BY id
+        """,
+    },
+    "Response Codes": {
+        "filename": "response_codes.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                status_code AS "Status",
+                content_type AS "Content Type",
+                redirect_url AS "Redirect URL",
+                response_time AS "Response Time"
+            FROM pages
+            ORDER BY id
+        """,
+    },
+    "Page Titles": {
+        "filename": "page_titles.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                status_code AS "Status",
+                title AS "Title",
+                title_length AS "Title Length",
+                indexable AS "Indexable"
+            FROM pages
+            ORDER BY id
+        """,
+    },
+    "Meta Description": {
+        "filename": "meta_description.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                status_code AS "Status",
+                description AS "Meta Description",
+                description_length AS "Description Length",
+                indexable AS "Indexable"
+            FROM pages
+            ORDER BY id
+        """,
+    },
+    "H1": {
+        "filename": "h1.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                status_code AS "Status",
+                h1 AS "H1",
+                h1_count AS "H1 Count",
+                indexable AS "Indexable"
+            FROM pages
+            ORDER BY id
+        """,
+    },
+    "H2": {
+        "filename": "h2.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                status_code AS "Status",
+                h2 AS "H2",
+                h2_count AS "H2 Count",
+                indexable AS "Indexable"
+            FROM pages
+            ORDER BY id
+        """,
+    },
+    "Crawl Depth": {
+        "filename": "crawl_depth.csv",
+        "sql": """
+            SELECT
+                url AS "URL",
+                depth AS "Crawl Depth",
+                COALESCE(parent_url, '') AS "Parent URL",
+                status_code AS "Status",
+                indexable AS "Indexable"
+            FROM pages
+            ORDER BY depth, id
+        """,
+    },
+}
+
+
+def prepare_spider_export(
+    db_path,
+    export_name,
+    output_path,
+):
+    spec = SPIDER_EXPORT_SPECS.get(
+        export_name
+    )
+
+    if not spec:
+        raise ValueError(
+            "未対応のExportです。"
+        )
+
+    conn = db_connect(db_path)
+    row_count = 0
+
+    try:
+        cursor = conn.execute(
+            spec["sql"]
+        )
+
+        columns = [
+            item[0]
+            for item in cursor.description
+        ]
+
+        with open(
+            output_path,
+            "w",
+            newline="",
+            encoding="utf-8-sig",
+        ) as fh:
+            writer = csv.writer(fh)
+            writer.writerow(columns)
+
+            while True:
+                rows = cursor.fetchmany(
+                    5000
+                )
+
+                if not rows:
+                    break
+
+                writer.writerows(rows)
+                row_count += len(rows)
+
+    finally:
+        conn.close()
+
+    return (
+        spec["filename"],
+        row_count,
+    )
+
+
 def short_url_label(url, is_root=False):
     """
     Site Structure用表示。
@@ -1483,6 +1758,7 @@ def start_crawl_job(
     public_mode,
     max_depth,
     polite_mode,
+    include_pattern,
 ):
     slot_acquired = False
 
@@ -1521,10 +1797,23 @@ def start_crawl_job(
         "heading_mode": heading_mode,
         "max_depth": max_depth,
         "polite_mode": bool(polite_mode),
+        "include_pattern": str(include_pattern or ""),
         "needs_refresh": False,
     }
 
     st.session_state["crawl_progress"] = progress
+
+    for key in [
+        "prepared_excel_bytes",
+        "prepared_excel_truncated",
+        "prepared_spider_export_path",
+        "prepared_spider_export_name",
+        "prepared_spider_export_rows",
+    ]:
+        st.session_state.pop(
+            key,
+            None,
+        )
 
     # 新しいクロール開始時は前回の完了メタ情報を消す。
     meta_path = Path(META_PATH)
@@ -1576,6 +1865,7 @@ def start_crawl_job(
                 public_mode=public_mode,
                 max_depth=max_depth,
                 adaptive_backoff=True,
+                include_pattern=include_pattern,
             )
 
             crawler.export_csv(
@@ -1833,6 +2123,23 @@ if run_crawl:
             )
             st.stop()
 
+    if crawl_scope == "Include Regex":
+        if not include_pattern:
+            st.error(
+                "Include URL Regexを入力してください。"
+            )
+            st.stop()
+
+        try:
+            re.compile(
+                include_pattern
+            )
+        except re.error as exc:
+            st.error(
+                f"Include Regexが不正です: {exc}"
+            )
+            st.stop()
+
     started = start_crawl_job(
         start_url.strip(),
         int(max_pages),
@@ -1843,6 +2150,7 @@ if run_crawl:
         PUBLIC_MODE,
         max_depth,
         polite_mode,
+        include_pattern,
     )
 
     if not started:
@@ -1945,6 +2253,24 @@ if result_max_depth is not None:
         f"Depth {int(result_max_depth) + 1}以降はクロールしていません。"
         " 上限階層ページ上の内部リンク自体はリンクデータとして保存しています。"
     )
+
+result_include_pattern = str(
+    final_state.get(
+        "include_pattern"
+    )
+    or ""
+).strip()
+
+if result_include_pattern:
+    st.info(
+        "Include Regexを使用したクロールです。"
+        " 開始URL以外は次のRegexに一致するURLだけをクロールしました。"
+    )
+    st.code(
+        result_include_pattern,
+        language=None,
+    )
+
 final_crawled = int(
     final_state.get("crawled") or len(df)
 )
@@ -2688,7 +3014,105 @@ if excel_bytes:
             "クロールDBには全件保存されています。"
         )
 
+st.markdown("#### SEO Spider-style CSV Exports")
+
+spider_export_name = st.selectbox(
+    "Export type",
+    list(
+        SPIDER_EXPORT_SPECS.keys()
+    ),
+    key="spider_export_type",
+)
+
+if spider_export_name == "H2":
+    st.caption(
+        "H2は Heading extraction = Full outline (H1-H6) "
+        "でクロールした場合に取得されます。"
+    )
+
+if spider_export_name in (
+    "All Inlinks",
+    "All Outlinks",
+):
+    st.caption(
+        "Browser版では内部リンクを対象にしています。"
+        "大規模サイトでは生成に時間がかかる場合があります。"
+    )
+
+if st.button(
+    "Prepare selected CSV",
+    use_container_width=True,
+    key="prepare_spider_export",
+):
+    safe_name = (
+        spider_export_name
+        .lower()
+        .replace(" ", "_")
+        .replace(">", "")
+        .replace("/", "_")
+    )
+
+    export_path = (
+        Path(JOB_DIR)
+        / f"export_{safe_name}.csv"
+    )
+
+    with st.spinner(
+        f"{spider_export_name} を生成しています..."
+    ):
+        filename, row_count = (
+            prepare_spider_export(
+                DB_PATH,
+                spider_export_name,
+                export_path,
+            )
+        )
+
+    st.session_state[
+        "prepared_spider_export_path"
+    ] = str(export_path)
+    st.session_state[
+        "prepared_spider_export_name"
+    ] = filename
+    st.session_state[
+        "prepared_spider_export_rows"
+    ] = int(row_count)
+
+prepared_export_path = st.session_state.get(
+    "prepared_spider_export_path"
+)
+
+if prepared_export_path:
+    prepared_path = Path(
+        prepared_export_path
+    )
+
+    if prepared_path.exists():
+        st.caption(
+            "Prepared: "
+            f"{int(st.session_state.get('prepared_spider_export_rows') or 0):,}"
+            " rows"
+        )
+
+        with open(
+            prepared_path,
+            "rb",
+        ) as export_fh:
+            st.download_button(
+                "Download prepared CSV",
+                data=export_fh,
+                file_name=(
+                    st.session_state.get(
+                        "prepared_spider_export_name"
+                    )
+                    or prepared_path.name
+                ),
+                mime="text/csv",
+                use_container_width=True,
+                key="download_spider_export",
+            )
+
 st.caption(
-    "5万URL対応では、重いExcel生成は必要なときだけ実行します。"
+    "5万URL対応では、重いExcel/Link Exportは必要なときだけ生成します。"
 )
 
