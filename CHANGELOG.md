@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.9.3
+- Include Regex crawl scope: start URL is crawled as the seed, then only matching internal URLs are queued
+- dedicated SEO Spider-style CSV exports for Internal HTML, All Inlinks, All Outlinks, Canonicals, Directives, Response Codes, Page Titles, Meta Description, H1, H2 and Crawl Depth
+- large link exports are generated on demand instead of during every app rerun
+
+
 ## v1.9.2
 - optional crawl depth limit (Depth 0-N)
 - default Polite Crawl Mode with 1-second request interval
