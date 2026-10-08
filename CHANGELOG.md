@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.9.2
+- optional crawl depth limit (Depth 0-N)
+- default Polite Crawl Mode with 1-second request interval
+- automatic backoff for 429/502/503/504 responses
+- Browser default concurrent crawl limit reduced to 1
+
+
 ## v1.9
 - Browser Release hardening
 - per-Job SQLite / CSV isolation
