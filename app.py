@@ -112,6 +112,8 @@ def save_crawl_meta(progress, meta_path=None):
         "error",
         "start_url",
         "heading_mode",
+        "max_depth",
+        "polite_mode",
     ]
 
     payload = {
@@ -211,6 +213,14 @@ def init_crawl_state():
                 "error",
                 "",
             )
+            saved.setdefault(
+                "max_depth",
+                None,
+            )
+            saved.setdefault(
+                "polite_mode",
+                True,
+            )
             saved["needs_refresh"] = False
 
             st.session_state[
@@ -239,6 +249,8 @@ def init_crawl_state():
                 "error": "",
                 "start_url": "",
                 "heading_mode": "basic",
+                "max_depth": None,
+                "polite_mode": True,
                 "needs_refresh": False,
             }
 
@@ -351,7 +363,7 @@ META_PATH = str(
 init_crawl_state()
 
 st.title(APP_TITLE)
-st.caption("HTML SEO監査用クローラー v1.9.1 Browser Release")
+st.caption("HTML SEO監査用クローラー v1.9.2 Browser Release")
 
 initial_crawl_state = get_crawl_snapshot()
 crawl_running = bool(
@@ -420,18 +432,76 @@ with st.sidebar:
         disabled=crawl_running,
     )
 
-    delay = st.number_input(
-        "Delay (seconds)",
-        min_value=(
+    limit_depth = st.checkbox(
+        "Limit crawl depth",
+        value=False,
+        disabled=crawl_running,
+        help=(
+            "Depth 0は開始URLです。"
+            "3を指定するとDepth 0〜3までクロールし、"
+            "Depth 4以降はキューへ追加しません。"
+        ),
+    )
+
+    max_depth_value = st.number_input(
+        "Max crawl depth",
+        min_value=0,
+        max_value=20,
+        value=3,
+        step=1,
+        disabled=(
+            crawl_running
+            or not limit_depth
+        ),
+    )
+
+    max_depth = (
+        int(max_depth_value)
+        if limit_depth
+        else None
+    )
+
+    polite_mode = st.checkbox(
+        "Polite crawl mode",
+        value=True,
+        disabled=crawl_running,
+        help=(
+            "対象サーバーへの負荷を抑える推奨設定です。"
+            "1クロール内は直列アクセスのまま、"
+            "最低1秒の間隔を取り、429/5xx時は自動で待機します。"
+        ),
+    )
+
+    delay_min = (
+        1.0
+        if polite_mode
+        else (
             0.2
             if PUBLIC_MODE
             else 0.0
-        ),
+        )
+    )
+
+    delay_default = (
+        1.0
+        if polite_mode
+        else 0.3
+    )
+
+    delay = st.number_input(
+        "Delay (seconds)",
+        min_value=float(delay_min),
         max_value=10.0,
-        value=0.3,
+        value=float(delay_default),
         step=0.1,
         disabled=crawl_running,
     )
+
+    if polite_mode:
+        st.caption(
+            "負荷軽減: 直列アクセス / 最低1秒間隔 / "
+            "429・502・503・504で最大60秒の自動バックオフ"
+        )
 
     heading_label = st.selectbox(
         "Heading extraction",
@@ -1411,6 +1481,8 @@ def start_crawl_job(
     store_body_text,
     store_external_links,
     public_mode,
+    max_depth,
+    polite_mode,
 ):
     slot_acquired = False
 
@@ -1447,6 +1519,8 @@ def start_crawl_job(
         "error": "",
         "start_url": start_url,
         "heading_mode": heading_mode,
+        "max_depth": max_depth,
+        "polite_mode": bool(polite_mode),
         "needs_refresh": False,
     }
 
@@ -1500,6 +1574,8 @@ def start_crawl_job(
                 store_external_links=store_external_links,
                 commit_every=25,
                 public_mode=public_mode,
+                max_depth=max_depth,
+                adaptive_backoff=True,
             )
 
             crawler.export_csv(
@@ -1765,6 +1841,8 @@ if run_crawl:
         store_body_text,
         store_external_links,
         PUBLIC_MODE,
+        max_depth,
+        polite_mode,
     )
 
     if not started:
@@ -1855,6 +1933,18 @@ if PUBLIC_MODE:
 
 final_state = get_crawl_snapshot()
 final_event = final_state.get("event", "")
+
+result_max_depth = final_state.get(
+    "max_depth"
+)
+
+if result_max_depth is not None:
+    st.info(
+        "Depth制限を使用したクロールです。"
+        f" Depth 0〜{int(result_max_depth)}まで取得し、"
+        f"Depth {int(result_max_depth) + 1}以降はクロールしていません。"
+        " 上限階層ページ上の内部リンク自体はリンクデータとして保存しています。"
+    )
 final_crawled = int(
     final_state.get("crawled") or len(df)
 )
