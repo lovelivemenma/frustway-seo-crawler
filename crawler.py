@@ -46,7 +46,7 @@ SKIP_EXTENSIONS = (
     ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
 )
 
-USER_AGENT = "Mozilla/5.0 (compatible; FRUSTWAY-SEOCrawler/1.9)"
+USER_AGENT = "Mozilla/5.0 (compatible; FRUSTWAY-SEOCrawler/1.9.2)"
 
 
 class PublicTargetBlocked(ValueError):
@@ -742,6 +742,8 @@ def crawl(
     store_external_links=False,
     commit_every=25,
     public_mode=False,
+    max_depth=None,
+    adaptive_backoff=True,
 ):
     start_url = normalize_url(start_url, start_url)
 
@@ -755,6 +757,12 @@ def crawl(
 
     if heading_mode not in ("basic", "full"):
         raise ValueError("heading_mode must be 'basic' or 'full'")
+
+    if max_depth is not None:
+        max_depth = int(max_depth)
+
+        if max_depth < 0:
+            raise ValueError("max_depth must be 0 or greater")
 
     root_hostname = urlsplit(start_url).hostname
 
@@ -818,7 +826,7 @@ def crawl(
 
     print()
     print("======================================")
-    print(" FRUSTWAY SEO Crawler v1.9")
+    print(" FRUSTWAY SEO Crawler v1.9.2")
     print("======================================")
     print(f"Start URL    : {start_url}")
     print(f"Max pages    : {max_pages}")
@@ -826,6 +834,15 @@ def crawl(
     print(f"Store body   : {store_body_text}")
     print(f"External     : {store_external_links}")
     print(f"Public mode  : {public_mode}")
+    print(
+        "Max depth    : "
+        + (
+            "Unlimited"
+            if max_depth is None
+            else str(max_depth)
+        )
+    )
+    print(f"Backoff      : {adaptive_backoff}")
     print(f"Database     : {db_path}")
     print()
 
@@ -855,6 +872,7 @@ def crawl(
 
         started = time.perf_counter()
         page_status = 0
+        adaptive_wait = 0.0
 
         try:
             if public_mode:
@@ -869,6 +887,41 @@ def crawl(
             page_status = status
             content_type = response.headers.get("content-type", "")
             x_robots_tag = response.headers.get("x-robots-tag", "").strip()
+
+            if adaptive_backoff and status in (
+                429,
+                502,
+                503,
+                504,
+            ):
+                retry_after = (
+                    response.headers.get(
+                        "retry-after",
+                        "",
+                    ).strip()
+                )
+
+                try:
+                    retry_seconds = float(
+                        retry_after
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ):
+                    retry_seconds = (
+                        10.0
+                        if status == 429
+                        else 5.0
+                    )
+
+                adaptive_wait = min(
+                    max(
+                        retry_seconds,
+                        1.0,
+                    ),
+                    60.0,
+                )
 
             data = blank_page_data(
                 current_url,
@@ -1020,6 +1073,10 @@ def crawl(
                         and is_crawlable_url(target)
                         and target not in visited
                         and target not in queued
+                        and (
+                            max_depth is None
+                            or depth < max_depth
+                        )
                     ):
                         queue.append(
                             (
@@ -1103,8 +1160,13 @@ def crawl(
             status_code=page_status,
         )
 
-        if delay > 0:
-            remaining = float(delay)
+        wait_seconds = max(
+            float(delay),
+            float(adaptive_wait),
+        )
+
+        if wait_seconds > 0:
+            remaining = wait_seconds
 
             # Stop要求へ早めに反応できるよう、小刻みに待機する。
             while remaining > 0:
@@ -1112,7 +1174,10 @@ def crawl(
                     stopped = True
                     break
 
-                sleep_for = min(0.1, remaining)
+                sleep_for = min(
+                    0.1,
+                    remaining,
+                )
                 time.sleep(sleep_for)
                 remaining -= sleep_for
 
@@ -1515,6 +1580,16 @@ def main():
         help="公開Web版向けのSSRF軽減チェックを有効化",
     )
 
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=None,
+        help=(
+            "クリック深度の上限。"
+            "0=開始URLのみ、3=Depth 0〜3をクロール"
+        ),
+    )
+
     args = parser.parse_args()
 
     conn = crawl(
@@ -1526,6 +1601,8 @@ def main():
         store_body_text=not args.no_body_text,
         store_external_links=args.store_external_links,
         public_mode=args.public_mode,
+        max_depth=args.max_depth,
+        adaptive_backoff=True,
     )
 
     export_csv(conn, args.csv)
